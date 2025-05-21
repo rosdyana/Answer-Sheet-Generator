@@ -1,9 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { createWorker } from 'tesseract.js'; // Import Tesseract.js
 import './App.css';
 
 function App() {
+  // --- State Declarations ---
   const [image, setImage] = useState(null);
-  const [answerKeyFromApi, setAnswerKeyFromApi] = useState({});
+  const [ocrResult, setOcrResult] = useState('');
+  const [answerKeyFromOcr, setAnswerKeyFromOcr] = useState({});
   const [editedAnswerKey, setEditedAnswerKey] = useState({});
   const [userAnswers, setUserAnswers] = useState({});
   const [score, setScore] = useState(null);
@@ -18,18 +21,79 @@ function App() {
   const [showReviewSection, setShowReviewSection] = useState(true);
   const [inputMethod, setInputMethod] = useState('uploadImage');
 
-  // NEW STATES FOR TIMER
-  const [testDurationMinutes, setTestDurationMinutes] = useState(60); // Default 60 minutes
+  // Timer states
+  const [testDurationMinutes, setTestDurationMinutes] = useState(60);
   const [remainingTimeSeconds, setRemainingTimeSeconds] = useState(testDurationMinutes * 60);
   const [timerActive, setTimerActive] = useState(false);
-  const timerIntervalRef = useRef(null); // Ref to hold the interval ID
+  const timerIntervalRef = useRef(null);
 
-  const BACKEND_URL = 'http://localhost:3056';
+  // Tesseract.js worker ref
+  const workerRef = useRef(null);
+
+  // --- Tesseract.js Worker Initialization ---
+  useEffect(() => {
+    const loadWorker = async () => {
+      if (!workerRef.current) {
+        console.log("Initializing Tesseract worker...");
+        try {
+          // CORRECTED: Removed the logger option that caused the DataCloneError
+          workerRef.current = await createWorker(); // 1. Create worker instance
+          console.log("Worker created:", workerRef.current);
+
+          await workerRef.current.load(); // 2. Load the core Tesseract.js script
+          console.log("Worker core loaded.");
+
+          await workerRef.current.loadLanguage('eng'); // 3. Load the language data
+          console.log("Language 'eng' loaded.");
+
+          await workerRef.current.initialize('eng');   // 4. Initialize the Tesseract engine
+          console.log("Tesseract worker initialized.");
+        } catch (initError) {
+          console.error("Failed to initialize Tesseract worker:", initError);
+          setError("Failed to initialize OCR. Please check console for details.");
+        }
+      }
+    };
+    loadWorker();
+    // Cleanup function for the effect
+    return () => {
+      if (workerRef.current) {
+        workerRef.current.terminate();
+        workerRef.current = null;
+        console.log("Tesseract worker terminated.");
+      }
+    };
+  }, []); // Empty dependency array means this runs once on mount
+
+  // --- Helper function to generate the editable key based on range and source key ---
+  const generateEditableKey = useCallback((start, end, sourceKey) => {
+    const newEditedKey = {};
+    const newUAnswers = {};
+
+    if (start !== null && end !== null && start <= end) {
+      for (let i = start; i <= end; i++) {
+        newEditedKey[i] = sourceKey[i] || '';
+        newUAnswers[i] = '';
+      }
+    }
+    const sortedKeys = Object.keys(newEditedKey).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+    const finalEditedKey = {};
+    sortedKeys.forEach(qNum => {
+      finalEditedKey[qNum] = newEditedKey[qNum];
+    });
+
+    setEditedAnswerKey(finalEditedKey);
+    setUserAnswers(newUAnswers);
+    setScore(null); // Clear score when answer key changes
+    setWrongAnswers([]); // Clear wrong answers
+  }, []);
+
 
   // --- Helper function to reset all states, including timer states ---
   const resetAppState = useCallback(() => {
     setImage(null);
-    setAnswerKeyFromApi({});
+    setOcrResult('');
+    setAnswerKeyFromOcr({});
     setEditedAnswerKey({});
     setUserAnswers({});
     setScore(null);
@@ -39,87 +103,98 @@ function App() {
     setShowImagePreview(false);
     setStartQuestion(null);
     setEndQuestion(null);
-    setShowReviewSection(true); // Always show review initially for new input
+    setShowReviewSection(true);
 
-    // Reset timer states
     clearInterval(timerIntervalRef.current);
     timerIntervalRef.current = null;
     setTimerActive(false);
-    setRemainingTimeSeconds(testDurationMinutes * 60); // Reset to full duration
-  }, [testDurationMinutes]); // Add testDurationMinutes to dependency array
+    setRemainingTimeSeconds(testDurationMinutes * 60);
+  }, [testDurationMinutes]);
 
 
-  const processImageWithBackend = useCallback(async (file) => {
+  // --- Parsing Logic for Tesseract.js raw text output ---
+  const parseAndSetAnswerKey = useCallback((rawOcrText) => {
+    const key = {};
+    const questionRegex = /(\d+)\s*\(?\s*([ABCDabcd])\s*\)?/g;
+    let match;
+    const foundQuestionNumbers = new Set();
+    const foundPairs = [];
+
+    while ((match = questionRegex.exec(rawOcrText)) !== null) {
+      const questionNumber = parseInt(match[1], 10);
+      const correctAnswer = match[2].toUpperCase();
+      foundPairs.push({ questionNumber, correctAnswer });
+      foundQuestionNumbers.add(questionNumber);
+    }
+
+    foundPairs.sort((a, b) => a.questionNumber - b.questionNumber);
+
+    foundPairs.forEach(pair => {
+      key[pair.questionNumber] = pair.correctAnswer;
+    });
+
+    setAnswerKeyFromOcr(key);
+
+    const sortedDetectedQNums = Array.from(foundQuestionNumbers).sort((a, b) => a - b);
+    let inferredStart = sortedDetectedQNums.length > 0 ? sortedDetectedQNums[0] : null;
+    let inferredEnd = sortedDetectedQNums.length > 0 ? sortedDetectedQNums[sortedDetectedQNums.length - 1] : null;
+
+    if (inferredStart === null) {
+      inferredStart = 1;
+      inferredEnd = 10;
+    }
+
+    setStartQuestion(inferredStart);
+    setEndQuestion(inferredEnd);
+
+    generateEditableKey(inferredStart, inferredEnd, key);
+  }, [generateEditableKey]);
+
+
+  // --- Image processing using Tesseract.js ---
+  const processImageWithTesseract = useCallback(async (file) => {
+    if (!workerRef.current) {
+      setError("Tesseract worker not initialized. Please try again or refresh.");
+      setLoading(false);
+      setShowImagePreview(false);
+      return;
+    }
+
     resetAppState();
     setLoading(true);
     setShowImagePreview(true);
 
-    const reader = new FileReader();
-    reader.readAsDataURL(file);
+    try {
+      const { data: { text } } = await workerRef.current.recognize(file);
+      setOcrResult(text);
+      console.log("OCR Raw Text Result (Tesseract):", text);
+      parseAndSetAnswerKey(text);
+      setShowReviewSection(true);
 
-    reader.onloadend = async () => {
-      const base64Data = reader.result.split(',')[1];
-      const mimeType = file.type;
-
-      try {
-        const response = await fetch(`${BACKEND_URL}/upload-answer-key`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            imageData: base64Data,
-            imageMimeType: mimeType,
-          }),
-        });
-
-        if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
-        }
-
-        const data = await response.json();
-        console.log("Answer Key from Backend API:", data.answerKey);
-
-        setAnswerKeyFromApi(data.answerKey);
-        const detectedQNums = Object.keys(data.answerKey).map(Number);
-        const inferredStart = detectedQNums.length > 0 ? Math.min(...detectedQNums) : null;
-        const inferredEnd = detectedQNums.length > 0 ? Math.max(...detectedQNums) : null;
-
-        setStartQuestion(inferredStart);
-        setEndQuestion(inferredEnd);
-
-        generateEditableKey(inferredStart, inferredEnd, data.answerKey);
-        setShowReviewSection(true);
-
-      } catch (err) {
-        console.error("API Error:", err);
-        setError(`Failed to process image: ${err.message}. Please try again or manually input the answer key.`);
-        setAnswerKeyFromApi({});
-        setEditedAnswerKey({});
-        setStartQuestion(null);
-        setEndQuestion(null);
-        setShowReviewSection(true);
-      } finally {
-        setLoading(false);
-        setShowImagePreview(false);
-      }
-    };
-
-    reader.onerror = () => {
-      setError("Failed to read image file.");
+    } catch (err) {
+      console.error("OCR Error (Tesseract):", err);
+      setError(`Failed to process image with OCR: ${err.message}. Please try again or manually input the answer key.`);
+      setAnswerKeyFromOcr({});
+      setEditedAnswerKey({});
+      setStartQuestion(null);
+      setEndQuestion(null);
+      setShowReviewSection(true);
+    } finally {
       setLoading(false);
       setShowImagePreview(false);
-    };
-  }, [resetAppState]);
+    }
+  }, [resetAppState, parseAndSetAnswerKey]);
+
 
   const handleImageUpload = (event) => {
     const file = event.target.files[0];
     if (file) {
-      processImageWithBackend(file);
+      setImage(URL.createObjectURL(file));
+      processImageWithTesseract(file);
     }
   };
 
+  // --- Save to JSON ---
   const handleSaveToJson = () => {
     if (Object.keys(editedAnswerKey).length === 0) {
       alert("No answer key to save. Please process an image or load a key first.");
@@ -140,6 +215,7 @@ function App() {
     alert("Answer key saved successfully!");
   };
 
+  // --- Load from JSON ---
   const handleLoadJson = (event) => {
     const file = event.target.files[0];
     if (!file) return;
@@ -166,7 +242,7 @@ function App() {
         setStartQuestion(inferredStart);
         setEndQuestion(inferredEnd);
 
-        setAnswerKeyFromApi(loadedKey);
+        setAnswerKeyFromOcr(loadedKey); // Store as if it came from OCR (for consistency)
         generateEditableKey(inferredStart, inferredEnd, loadedKey);
         setShowReviewSection(true);
 
@@ -185,38 +261,18 @@ function App() {
     reader.readAsText(file);
   };
 
-  const generateEditableKey = useCallback((start, end, sourceKey) => {
-    const newEditedKey = {};
-    const newUAnswers = {};
 
-    if (start !== null && end !== null && start <= end) {
-      for (let i = start; i <= end; i++) {
-        newEditedKey[i] = sourceKey[i] || '';
-        newUAnswers[i] = '';
-      }
-    }
-    const sortedKeys = Object.keys(newEditedKey).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
-    const finalEditedKey = {};
-    sortedKeys.forEach(qNum => {
-      finalEditedKey[qNum] = newEditedKey[qNum];
-    });
-
-    setEditedAnswerKey(finalEditedKey);
-    setUserAnswers(newUAnswers);
-    setScore(null); // Clear score when answer key changes
-    setWrongAnswers([]); // Clear wrong answers
-  }, []);
-
+  // --- Effect for dynamic range changes (user input) ---
   useEffect(() => {
     if (startQuestion !== null && endQuestion !== null) {
       const currentMinQ = Object.keys(editedAnswerKey).length > 0 ? parseInt(Object.keys(editedAnswerKey)[0]) : null;
       const currentMaxQ = Object.keys(editedAnswerKey).length > 0 ? parseInt(Object.keys(editedAnswerKey)[Object.keys(editedAnswerKey).length - 1]) : null;
 
       if (currentMinQ !== startQuestion || currentMaxQ !== endQuestion || Object.keys(editedAnswerKey).length === 0) {
-        generateEditableKey(startQuestion, endQuestion, answerKeyFromApi);
+        generateEditableKey(startQuestion, endQuestion, answerKeyFromOcr);
       }
     }
-  }, [startQuestion, endQuestion, generateEditableKey, answerKeyFromApi, editedAnswerKey]);
+  }, [startQuestion, endQuestion, generateEditableKey, answerKeyFromOcr, editedAnswerKey]);
 
 
   const handleEditedAnswerKeyChange = (question, value) => {
@@ -273,7 +329,7 @@ function App() {
         if (newMin !== startQuestion) setStartQuestion(newMin);
         if (newMax !== endQuestion) setEndQuestion(newMax);
       }
-      setScore(null); // Clear score when key changes
+      setScore(null);
       setWrongAnswers([]);
     }
   };
@@ -292,25 +348,23 @@ function App() {
         setRemainingTimeSeconds(prevTime => prevTime - 1);
       }, 1000);
     } else if (remainingTimeSeconds === 0 && timerActive) {
-      // Timer has run out, force submit
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
       setTimerActive(false);
-      handleSubmitTest(new Event('submit')); // Force submit
+      handleSubmitTest(new Event('submit'));
       alert("Time's up! Your test has been submitted automatically.");
     }
 
-    // Cleanup function for the effect
     return () => {
       clearInterval(timerIntervalRef.current);
       timerIntervalRef.current = null;
     };
-  }, [timerActive, remainingTimeSeconds]); // Dependencies for the effect
+  }, [timerActive, remainingTimeSeconds]);
 
   const startTimer = () => {
     if (!timerActive && Object.keys(editedAnswerKey).length > 0) {
       setTimerActive(true);
-      setScore(null); // Clear previous results when starting a new test
+      setScore(null);
       setWrongAnswers([]);
     } else if (Object.keys(editedAnswerKey).length === 0) {
       alert("Please load or create an answer key before starting the test.");
@@ -326,7 +380,7 @@ function App() {
   const resetTimer = () => {
     pauseTimer();
     setRemainingTimeSeconds(testDurationMinutes * 60);
-    setUserAnswers({}); // Clear user answers on reset
+    setUserAnswers({});
     setScore(null);
     setWrongAnswers([]);
   };
@@ -338,12 +392,10 @@ function App() {
   };
 
   const handleSubmitTest = (event) => {
-    // Prevent default form submission if it's a real event from a button click
     if (event && typeof event.preventDefault === 'function') {
       event.preventDefault();
     }
 
-    // Stop the timer if it's active when submitting
     pauseTimer();
 
     let correctCount = 0;
@@ -384,7 +436,7 @@ function App() {
               checked={inputMethod === 'uploadImage'}
               onChange={() => { setInputMethod('uploadImage'); resetAppState(); }}
             />
-            Upload Image (AI OCR)
+            Upload Image (Tesseract.js OCR)
           </label>
           <label>
             <input
@@ -436,7 +488,7 @@ function App() {
           </div>
           {showReviewSection && (
             <div className="answer-key-review-section">
-              <p>Based on {inputMethod === 'uploadImage' ? 'AI' : 'loaded JSON'}, we inferred questions from <strong style={{ color: 'green' }}>{startQuestion || 'N/A'}</strong> to <strong style={{ color: 'green' }}>{endQuestion || 'N/A'}</strong>. Adjust if needed.</p>
+              <p>Based on {inputMethod === 'uploadImage' ? 'OCR' : 'loaded JSON'}, we inferred questions from <strong style={{ color: 'green' }}>{startQuestion || 'N/A'}</strong> to <strong style={{ color: 'green' }}>{endQuestion || 'N/A'}</strong>. Adjust if needed.</p>
 
               <div className="range-controls">
                 <label>Start Question:
@@ -456,7 +508,7 @@ function App() {
                   />
                 </label>
                 <button
-                  onClick={() => generateEditableKey(startQuestion, endQuestion, answerKeyFromApi)}
+                  onClick={() => generateEditableKey(startQuestion, endQuestion, answerKeyFromOcr)}
                   disabled={!startQuestion || !endQuestion || startQuestion > endQuestion}
                 >
                   Apply Range
@@ -510,14 +562,14 @@ function App() {
                   const newDuration = parseInt(e.target.value, 10);
                   if (!isNaN(newDuration) && newDuration >= 1) {
                     setTestDurationMinutes(newDuration);
-                    setRemainingTimeSeconds(newDuration * 60); // Update remaining time
-                  } else if (e.target.value === '') { // Allow empty input temporarily
+                    setRemainingTimeSeconds(newDuration * 60);
+                  } else if (e.target.value === '') {
                     setTestDurationMinutes('');
                     setRemainingTimeSeconds(0);
                   }
                 }}
                 min="1"
-                disabled={timerActive} // Disable input while timer is active
+                disabled={timerActive}
               />
             </label>
             <div className="timer-display">Time: {formatTime(remainingTimeSeconds)}</div>
@@ -539,8 +591,8 @@ function App() {
                     onChange={(e) => handleUserAnswerChange(question, e.target.value)}
                     pattern="[A-Da-d]"
                     title="Enter A, B, C, or D"
-                    required={timerActive} // Required only when timer is active
-                    disabled={!timerActive && score !== null} // Disable input if not active AND already submitted
+                    required={timerActive}
+                    disabled={!timerActive && score !== null}
                   />
                 </div>
               ))}
