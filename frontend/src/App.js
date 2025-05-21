@@ -16,13 +16,17 @@ function App() {
   const [endQuestion, setEndQuestion] = useState(null);
 
   const [showReviewSection, setShowReviewSection] = useState(true);
+  const [inputMethod, setInputMethod] = useState('uploadImage');
 
-  // NEW STATE: To choose input method
-  const [inputMethod, setInputMethod] = useState('uploadImage'); // 'uploadImage' or 'loadJson'
+  // NEW STATES FOR TIMER
+  const [testDurationMinutes, setTestDurationMinutes] = useState(60); // Default 60 minutes
+  const [remainingTimeSeconds, setRemainingTimeSeconds] = useState(testDurationMinutes * 60);
+  const [timerActive, setTimerActive] = useState(false);
+  const timerIntervalRef = useRef(null); // Ref to hold the interval ID
 
   const BACKEND_URL = 'http://localhost:3056';
 
-  // --- Helper function to reset all states ---
+  // --- Helper function to reset all states, including timer states ---
   const resetAppState = useCallback(() => {
     setImage(null);
     setAnswerKeyFromApi({});
@@ -36,11 +40,17 @@ function App() {
     setStartQuestion(null);
     setEndQuestion(null);
     setShowReviewSection(true); // Always show review initially for new input
-  }, []);
+
+    // Reset timer states
+    clearInterval(timerIntervalRef.current);
+    timerIntervalRef.current = null;
+    setTimerActive(false);
+    setRemainingTimeSeconds(testDurationMinutes * 60); // Reset to full duration
+  }, [testDurationMinutes]); // Add testDurationMinutes to dependency array
 
 
   const processImageWithBackend = useCallback(async (file) => {
-    resetAppState(); // Reset everything before new processing
+    resetAppState();
     setLoading(true);
     setShowImagePreview(true);
 
@@ -101,8 +111,7 @@ function App() {
       setLoading(false);
       setShowImagePreview(false);
     };
-  }, [resetAppState]); // Include resetAppState in dependencies
-
+  }, [resetAppState]);
 
   const handleImageUpload = (event) => {
     const file = event.target.files[0];
@@ -111,14 +120,13 @@ function App() {
     }
   };
 
-  // --- NEW: Save to JSON ---
   const handleSaveToJson = () => {
     if (Object.keys(editedAnswerKey).length === 0) {
       alert("No answer key to save. Please process an image or load a key first.");
       return;
     }
     const fileName = `answer_key_${startQuestion || 'na'}-${endQuestion || 'na'}.json`;
-    const jsonString = JSON.stringify(editedAnswerKey, null, 2); // Pretty print JSON
+    const jsonString = JSON.stringify(editedAnswerKey, null, 2);
 
     const blob = new Blob([jsonString], { type: 'application/json' });
     const href = URL.createObjectURL(blob);
@@ -128,16 +136,15 @@ function App() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
-    URL.revokeObjectURL(href); // Clean up the URL object
+    URL.revokeObjectURL(href);
     alert("Answer key saved successfully!");
   };
 
-  // --- NEW: Load from JSON ---
   const handleLoadJson = (event) => {
     const file = event.target.files[0];
     if (!file) return;
 
-    resetAppState(); // Reset states for a fresh load
+    resetAppState();
     setLoading(true);
     setError('');
 
@@ -145,7 +152,6 @@ function App() {
     reader.onload = (e) => {
       try {
         const loadedKey = JSON.parse(e.target.result);
-        // Basic validation for the loaded JSON
         if (typeof loadedKey !== 'object' || loadedKey === null || Array.isArray(loadedKey)) {
           throw new Error("Invalid JSON structure. Expected an object.");
         }
@@ -160,15 +166,14 @@ function App() {
         setStartQuestion(inferredStart);
         setEndQuestion(inferredEnd);
 
-        // Populate answerKeyFromApi (as if it came from API) and editedAnswerKey
         setAnswerKeyFromApi(loadedKey);
         generateEditableKey(inferredStart, inferredEnd, loadedKey);
-        setShowReviewSection(true); // Show review section after loading
+        setShowReviewSection(true);
 
       } catch (err) {
         console.error("Error loading JSON file:", err);
         setError(`Failed to load JSON file: ${err.message}. Please ensure it's a valid answer key JSON.`);
-        resetAppState(); // Reset if load fails
+        resetAppState();
       } finally {
         setLoading(false);
       }
@@ -198,6 +203,8 @@ function App() {
 
     setEditedAnswerKey(finalEditedKey);
     setUserAnswers(newUAnswers);
+    setScore(null); // Clear score when answer key changes
+    setWrongAnswers([]); // Clear wrong answers
   }, []);
 
   useEffect(() => {
@@ -205,7 +212,6 @@ function App() {
       const currentMinQ = Object.keys(editedAnswerKey).length > 0 ? parseInt(Object.keys(editedAnswerKey)[0]) : null;
       const currentMaxQ = Object.keys(editedAnswerKey).length > 0 ? parseInt(Object.keys(editedAnswerKey)[Object.keys(editedAnswerKey).length - 1]) : null;
 
-      // Only regenerate if the range has explicitly changed, or if key is empty (first load)
       if (currentMinQ !== startQuestion || currentMaxQ !== endQuestion || Object.keys(editedAnswerKey).length === 0) {
         generateEditableKey(startQuestion, endQuestion, answerKeyFromApi);
       }
@@ -267,6 +273,8 @@ function App() {
         if (newMin !== startQuestion) setStartQuestion(newMin);
         if (newMax !== endQuestion) setEndQuestion(newMax);
       }
+      setScore(null); // Clear score when key changes
+      setWrongAnswers([]);
     }
   };
 
@@ -277,8 +285,67 @@ function App() {
     }));
   };
 
+  // --- TIMER LOGIC ---
+  useEffect(() => {
+    if (timerActive && remainingTimeSeconds > 0) {
+      timerIntervalRef.current = setInterval(() => {
+        setRemainingTimeSeconds(prevTime => prevTime - 1);
+      }, 1000);
+    } else if (remainingTimeSeconds === 0 && timerActive) {
+      // Timer has run out, force submit
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+      setTimerActive(false);
+      handleSubmitTest(new Event('submit')); // Force submit
+      alert("Time's up! Your test has been submitted automatically.");
+    }
+
+    // Cleanup function for the effect
+    return () => {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    };
+  }, [timerActive, remainingTimeSeconds]); // Dependencies for the effect
+
+  const startTimer = () => {
+    if (!timerActive && Object.keys(editedAnswerKey).length > 0) {
+      setTimerActive(true);
+      setScore(null); // Clear previous results when starting a new test
+      setWrongAnswers([]);
+    } else if (Object.keys(editedAnswerKey).length === 0) {
+      alert("Please load or create an answer key before starting the test.");
+    }
+  };
+
+  const pauseTimer = () => {
+    setTimerActive(false);
+    clearInterval(timerIntervalRef.current);
+    timerIntervalRef.current = null;
+  };
+
+  const resetTimer = () => {
+    pauseTimer();
+    setRemainingTimeSeconds(testDurationMinutes * 60);
+    setUserAnswers({}); // Clear user answers on reset
+    setScore(null);
+    setWrongAnswers([]);
+  };
+
+  const formatTime = (totalSeconds) => {
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  };
+
   const handleSubmitTest = (event) => {
-    event.preventDefault();
+    // Prevent default form submission if it's a real event from a button click
+    if (event && typeof event.preventDefault === 'function') {
+      event.preventDefault();
+    }
+
+    // Stop the timer if it's active when submitting
+    pauseTimer();
+
     let correctCount = 0;
     const incorrect = [];
 
@@ -434,6 +501,31 @@ function App() {
       {shouldShowReviewAndSimulation && (
         <div className="simulation-section">
           <h2>3. Test Simulation (Enter Your Answers)</h2>
+          <div className="timer-controls">
+            <label>Test Duration (Minutes):
+              <input
+                type="number"
+                value={testDurationMinutes}
+                onChange={(e) => {
+                  const newDuration = parseInt(e.target.value, 10);
+                  if (!isNaN(newDuration) && newDuration >= 1) {
+                    setTestDurationMinutes(newDuration);
+                    setRemainingTimeSeconds(newDuration * 60); // Update remaining time
+                  } else if (e.target.value === '') { // Allow empty input temporarily
+                    setTestDurationMinutes('');
+                    setRemainingTimeSeconds(0);
+                  }
+                }}
+                min="1"
+                disabled={timerActive} // Disable input while timer is active
+              />
+            </label>
+            <div className="timer-display">Time: {formatTime(remainingTimeSeconds)}</div>
+            <button onClick={startTimer} disabled={timerActive || loading || Object.keys(editedAnswerKey).length === 0}>Start Test</button>
+            <button onClick={pauseTimer} disabled={!timerActive}>Pause</button>
+            <button onClick={resetTimer} disabled={timerActive && remainingTimeSeconds > 0}>Reset</button>
+          </div>
+
           <form onSubmit={handleSubmitTest} className="answer-form">
             <div className="answer-grid">
               {sortedQuestionsFromKey.map(question => (
@@ -447,12 +539,13 @@ function App() {
                     onChange={(e) => handleUserAnswerChange(question, e.target.value)}
                     pattern="[A-Da-d]"
                     title="Enter A, B, C, or D"
-                    required
+                    required={timerActive} // Required only when timer is active
+                    disabled={!timerActive && score !== null} // Disable input if not active AND already submitted
                   />
                 </div>
               ))}
             </div>
-            <button type="submit" className="submit-button">Submit Test</button>
+            <button type="submit" className="submit-button" disabled={loading || !timerActive}>Submit Test</button>
           </form>
         </div>
       )}
