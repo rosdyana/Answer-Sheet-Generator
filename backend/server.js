@@ -3,8 +3,9 @@ const http = require('http');
 const { URLSearchParams } = require('url'); // To parse form data
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const port = 3056;
+const port = process.env.PORT || 3056;
 const API_KEY = process.env.GEMINI_API_KEY;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3055';
 
 if (!API_KEY) {
     console.error("GEMINI_API_KEY is not set in .env file!");
@@ -14,7 +15,7 @@ const genAI = new GoogleGenerativeAI(API_KEY);
 
 const server = http.createServer(async (req, res) => {
     // Set CORS headers for all responses
-    res.setHeader('Access-Control-Allow-Origin', 'http://localhost:3055'); // Allow your React app
+    res.setHeader('Access-Control-Allow-Origin', FRONTEND_URL); // Allow your React app
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
